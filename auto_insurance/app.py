@@ -367,7 +367,7 @@ def view_predictions():
         if engine is None:
             return error_page("Database not available."), 500
 
-        df_predictions = pd.read_sql("SELECT * FROM prediction LIMIT 100", engine)
+        df_predictions = pd.read_sql("SELECT * FROM prediction LIMIT 50", engine)
         if df_predictions.empty:
             return error_page("No predictions found. Upload a CSV first."), 404
 
