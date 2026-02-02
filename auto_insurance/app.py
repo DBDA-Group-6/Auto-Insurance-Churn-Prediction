@@ -381,8 +381,8 @@ def predict():
 
         # 7) Store in database (only key columns + prediction)
         df_to_db = df_result[[
-            'individual_id', 'address_id', 'curr_ann_amt', 'age_in_years',
-            'income', 'city', 'county', 'marital_status', 'Churn_Prediction'
+            'individual_id', 'address_id', 'curr_ann_amt','days_tenure' ,'cust_orig_date', 'age_in_years',
+            'date_of_birth', 'latitude' ,'longitude', 'city', 'state', 'county', 'income','has_children', 'length_of_residence', 'marital_status', 'home_market_value', 'home_owner','college_degree', 'good_credit', 'Churn_Prediction'
         ]].copy()
 
         df_to_db.to_sql('prediction', engine, if_exists='replace', index=False)
