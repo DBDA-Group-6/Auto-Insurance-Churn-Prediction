@@ -1,0 +1,497 @@
+from flask import Flask, request, render_template, jsonify, make_response
+import pymysql
+import pandas as pd
+import numpy as np
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+import io
+import os
+import traceback
+import joblib
+
+app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB max file size
+app.config['UPLOAD_FOLDER'] = '/tmp'
+
+# RDS Connection details – override via environment variables in production
+RDS_HOST     = os.getenv('RDS_HOST',     'autodb.cr2mkcsuu4rc.ap-south-1.rds.amazonaws.com')
+RDS_USER     = os.getenv('RDS_USER',     'admin')
+RDS_PASSWORD = os.getenv('RDS_PASSWORD', 'sqlNeguveng')
+RDS_DB       = os.getenv('RDS_DB',       'autodb')
+MODEL_PATH   = os.getenv('MODEL_PATH',   'my_model.joblib')
+
+# SQLAlchemy engine
+try:
+    engine = create_engine(
+        f"mysql+pymysql://{RDS_USER}:{RDS_PASSWORD}@{RDS_HOST}:3306/{RDS_DB}",
+        pool_pre_ping=True,
+        pool_recycle=3600
+    )
+    print("Database engine created successfully")
+except Exception as e:
+    print(f"Error creating database engine: {e}")
+    engine = None
+
+# ===========================================================================
+# PREPROCESSING CONSTANTS  (must match final_model.py exactly)
+# ===========================================================================
+COLUMNS_TO_DROP = [
+    'individual_id', 'address_id', 'cust_orig_date',
+    'date_of_birth', 'latitude', 'longitude',
+    'city', 'county', 'acct_suspd_date', 'state'
+]
+
+HOME_MARKET_LABEL_MAP = {
+    '1000 - 24999': 0,  '25000 - 49999': 1,  '50000 - 74999': 2,
+    '75000 - 99999': 3, '100000 - 124999': 4, '125000 - 149999': 5,
+    '150000 - 174999': 6, '175000 - 199999': 7, '200000 - 224999': 8,
+    '225000 - 249999': 9, '250000 - 274999': 10, '275000 - 299999': 11,
+    '300000 - 349999': 12, '350000 - 399999': 13, '400000 - 449999': 14,
+    '450000 - 499999': 15, '500000 - 749999': 16, '750000 - 999999': 17,
+    '1000000 Plus': 18
+}
+
+OUTLIER_COLS = ['curr_ann_amt', 'days_tenure', 'age_in_years',
+                'length_of_residence', 'income']
+
+
+# ===========================================================================
+# PREPROCESSING FUNCTION  (pandas – mirrors the PySpark notebook logic)
+# ===========================================================================
+def preprocess(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Takes the raw CSV DataFrame and returns the preprocessed DataFrame
+    ready for model.predict().  Steps match final_model.py / notebooks exactly.
+    """
+    df = df_raw.copy()
+
+    # 1) Drop identifier / date columns (ignore if missing)
+    df.drop(columns=COLUMNS_TO_DROP, errors='ignore', inplace=True)
+
+    # 2) Drop the Churn column – it must NOT be fed to the model
+    df.drop(columns=['Churn'], errors='ignore', inplace=True)
+
+    # 3) Label-encode home_market_value
+    df['home_market_value'] = df['home_market_value'].map(HOME_MARKET_LABEL_MAP)
+
+    # 4) One-hot encode marital_status (only remaining categorical column)
+    df = pd.get_dummies(df, columns=['marital_status'], dtype=int)
+
+    # 5) Cap outliers (IQR × 1.5) on the 5 numeric columns
+    for col in OUTLIER_COLS:
+        if col not in df.columns:
+            continue
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        iqr = q3 - q1
+        df[col] = df[col].clip(lower=q1 - 1.5 * iqr, upper=q3 + 1.5 * iqr)
+
+    # 6) Fill remaining nulls  (numeric → median)
+    for col in df.columns:
+        if df[col].isna().sum() == 0:
+            continue
+        if df[col].dtype in ['int64', 'float64', 'int32', 'float32']:
+            df[col].fillna(df[col].median(), inplace=True)
+        else:
+            df[col].fillna(df[col].mode()[0], inplace=True)
+
+    # NOTE: scaling is intentionally NOT done here.
+    # The scaler was fit on the training set and is saved inside
+    # my_model.joblib.  upload() loads it and calls .transform() —
+    # never .fit() — so the model sees the same scale it was trained on.
+
+    return df
+
+
+# ===========================================================================
+# DATABASE SETUP
+# ===========================================================================
+def setup_database():
+    """Create database autodb if it does not exist."""
+    try:
+        conn = pymysql.connect(
+            host=RDS_HOST, user=RDS_USER, password=RDS_PASSWORD,
+            port=3306, connect_timeout=10
+        )
+        cursor = conn.cursor()
+        cursor.execute("CREATE DATABASE IF NOT EXISTS autodb")
+        print("Database 'autodb' created/verified successfully")
+        cursor.close()
+        conn.close()
+        return True
+    except pymysql.MySQLError as e:
+        print(f"Database setup error: {e}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error during database setup: {e}")
+        return False
+
+
+# ===========================================================================
+# ROUTES
+# ===========================================================================
+@app.route('/')
+def index():
+    """Render the home/landing page."""
+    return render_template('home.html')
+
+
+@app.route('/ml-model')
+def ml_model():
+    """Render the single-file ML upload form."""
+    return render_template('index.html')
+
+
+@app.route('/dashboard')
+def dashboard():
+    """Render the Tableau dashboard."""
+    return render_template('dashboard.html')
+
+
+# ---------------------------------------------------------------------------
+# UPLOAD → PREPROCESS → PREDICT  (single file flow)
+# ---------------------------------------------------------------------------
+@app.route('/upload', methods=['POST'])
+def upload():
+    """
+    Accepts ONE raw CSV file, preprocesses it with pandas (mirrors the
+    PySpark notebook pipeline), runs the XGBoost model, concatenates the
+    prediction column onto the original raw DataFrame, persists everything
+    to RDS, and renders the result page.
+    """
+    try:
+        if engine is None:
+            return error_page("Database connection not available."), 500
+
+        print("=" * 50)
+        print("UPLOAD REQUEST RECEIVED")
+        print(f"Content-Type: {request.content_type}")
+        print(f"Files in request: {list(request.files.keys())}")
+        print("=" * 50)
+
+        # --- validate incoming file -------------------------------------------
+        if not request.files:
+            return error_page("No file was uploaded. Please select a CSV file."), 400
+
+        if 'csv1' not in request.files:
+            return error_page("Raw data CSV is missing from the request."), 400
+
+        csv1 = request.files['csv1']
+
+        if not csv1 or csv1.filename == '':
+            return error_page("No file was selected. Please choose a CSV file."), 400
+
+        if not csv1.filename.lower().endswith('.csv'):
+            return error_page(f"File must be a CSV. Got: {csv1.filename}"), 400
+
+        print(f"Received file: {csv1.filename}")
+
+        # --- read into DataFrame ----------------------------------------------
+        try:
+            csv1_content = csv1.read()
+            if len(csv1_content) == 0:
+                return error_page("The uploaded CSV file is empty."), 400
+            df_raw = pd.read_csv(io.BytesIO(csv1_content))
+        except pd.errors.EmptyDataError:
+            return error_page("The CSV file is empty or invalid."), 400
+        except pd.errors.ParserError as e:
+            return error_page(f"Error parsing CSV: {str(e)}"), 400
+        except Exception as e:
+            traceback.print_exc()
+            return error_page(f"Failed to read CSV: {str(e)}"), 400
+
+        if df_raw.empty:
+            return error_page("CSV contains no data rows."), 400
+
+        print(f"Raw data: {df_raw.shape[0]} rows × {df_raw.shape[1]} cols")
+
+        # --- persist raw data to RDS ------------------------------------------
+        try:
+            df_raw.to_sql(name='rawdata', con=engine, if_exists='replace', index=False)
+            print("rawdata table saved")
+        except SQLAlchemyError as e:
+            traceback.print_exc()
+            return error_page(f"Database error (rawdata): {str(e)}"), 500
+
+        # --- PREPROCESS -------------------------------------------------------
+        print("Running preprocessing …")
+        try:
+            df_preprocessed = preprocess(df_raw)
+            print(f"Preprocessed: {df_preprocessed.shape[0]} rows × {df_preprocessed.shape[1]} cols")
+        except Exception as e:
+            traceback.print_exc()
+            return error_page(f"Preprocessing failed: {str(e)}"), 500
+
+        # persist preprocessed data
+        try:
+            df_preprocessed.to_sql(name='processed', con=engine, if_exists='replace', index=False)
+            print("processed table saved")
+        except SQLAlchemyError as e:
+            traceback.print_exc()
+            return error_page(f"Database error (processed): {str(e)}"), 500
+
+        # --- LOAD MODEL ARTIFACT & PREDICT ------------------------------------
+        # The artifact is a dict saved by final_model.py:
+        #   { "model": XGBClassifier, "scaler": StandardScaler, "columns": [...] }
+        print("Loading model artifact …")
+        if not os.path.exists(MODEL_PATH):
+            return error_page(f"Model file '{MODEL_PATH}' not found on server."), 404
+
+        try:
+            artifact   = joblib.load(MODEL_PATH)
+            model      = artifact["model"]
+            scaler     = artifact["scaler"]
+            train_cols = artifact["columns"]
+
+            # --- align columns to training order (Bug 3 fix) ---
+            # • adds any missing dummy columns as 0
+            # • drops any extra columns not seen during training
+            # • reorders to match the exact order the model expects
+            df_aligned = df_preprocessed.reindex(columns=train_cols, fill_value=0)
+
+            # --- scale with the TRAINING scaler (Bug 1 & 2 fix) ---
+            # transform() only — never fit() — so every value is scaled
+            # using the mean & std the model actually learned.
+            df_scaled  = scaler.transform(df_aligned)
+
+            predictions = model.predict(df_scaled)
+            print(f"Predictions generated: {len(predictions)} values")
+        except Exception as e:
+            traceback.print_exc()
+            return error_page(f"Model prediction failed: {str(e)}"), 500
+
+        # --- CONCAT prediction onto raw & persist -----------------------------
+        df_result = df_raw.copy()
+        df_result['Churn_Prediction'] = predictions
+
+        try:
+            df_result.to_sql(name='prediction', con=engine, if_exists='replace', index=False)
+            print("prediction table saved")
+        except SQLAlchemyError as e:
+            traceback.print_exc()
+            return error_page(f"Database error (prediction): {str(e)}"), 500
+
+        # --- summary stats for the success page -------------------------------
+        unique_preds = pd.Series(predictions).value_counts().to_dict()
+
+        print("UPLOAD + PREDICT SUCCESSFUL")
+        return success_page(csv1.filename, df_raw, df_result, unique_preds)
+
+    except Exception as e:
+        traceback.print_exc()
+        return error_page(f"Unexpected error: {str(e)}"), 500
+
+
+# ---------------------------------------------------------------------------
+# VIEW & DOWNLOAD predictions
+# ---------------------------------------------------------------------------
+@app.route('/view_predictions')
+def view_predictions():
+    try:
+        if engine is None:
+            return error_page("Database not available."), 500
+
+        df_predictions = pd.read_sql("SELECT * FROM prediction LIMIT 100", engine)
+        if df_predictions.empty:
+            return error_page("No predictions found. Upload a CSV first."), 404
+
+        total_count = pd.read_sql("SELECT COUNT(*) as total FROM prediction", engine)['total'][0]
+        table_html  = df_predictions.to_html(classes='prediction-table', index=False, max_rows=100)
+
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>View Predictions</title>
+        <style>
+            body {{font-family: Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px;}}
+            .container {{background: white; border-radius: 20px; padding: 40px; max-width: 1200px; margin: 0 auto;}}
+            h2 {{color: #2196F3; text-align: center;}}
+            .prediction-table {{width: 100%; border-collapse: collapse; margin: 20px 0;}}
+            .prediction-table th {{background: #2196F3; color: white; padding: 12px; text-align: left;}}
+            .prediction-table td {{padding: 10px; border-bottom: 1px solid #ddd;}}
+            .prediction-table tr:hover {{background: #f5f5f5;}}
+            .buttons {{text-align: center; margin-top: 30px;}}
+            a {{display: inline-block; margin: 5px; padding: 12px 25px; background: #4CAF50; color: white; text-decoration: none; border-radius: 10px;}}
+            a.secondary {{background: #2196F3;}}
+            a.download {{background: #FF9800;}}
+        </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>📋 Prediction Results</h2>
+                <p style="text-align: center; color: #666;">Showing {len(df_predictions)} of {total_count} predictions</p>
+                <div style="overflow-x: auto;">{table_html}</div>
+                <div class="buttons">
+                    <a href="/">Home</a>
+                    <a href="/ml-model">Upload New Data</a>
+                    <a href="/download_predictions" class="download">📥 Download All ({total_count} rows)</a>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+    except Exception as e:
+        traceback.print_exc()
+        return error_page(f"Error: {str(e)}"), 500
+
+
+@app.route('/download_predictions')
+def download_predictions():
+    try:
+        if engine is None:
+            return error_page("Database not available."), 500
+
+        df_predictions = pd.read_sql("SELECT * FROM prediction", engine)
+        if df_predictions.empty:
+            return error_page("No predictions found."), 404
+
+        csv_data = df_predictions.to_csv(index=False)
+        response = make_response(csv_data)
+        response.headers['Content-Type'] = 'text/csv'
+        response.headers['Content-Disposition'] = 'attachment; filename=predictions.csv'
+        return response
+    except Exception as e:
+        traceback.print_exc()
+        return error_page(f"Download error: {str(e)}"), 500
+
+
+# ---------------------------------------------------------------------------
+# HEALTH CHECK
+# ---------------------------------------------------------------------------
+@app.route('/health')
+def health():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return jsonify({"status": "healthy"}), 200
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+
+
+# ===========================================================================
+# PAGE HELPERS
+# ===========================================================================
+def error_page(message):
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Error</title>
+        <style>
+            body {{font-family: Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 20px;}}
+            .container {{background: white; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); padding: 40px; max-width: 500px; text-align: center;}}
+            h2 {{color: #e53935; margin-bottom: 20px;}}
+            p {{color: #666; margin-bottom: 30px;}}
+            a {{display: inline-block; padding: 12px 30px; background: #4CAF50; color: white; text-decoration: none; border-radius: 10px; font-weight: 600;}}
+            a:hover {{background: #45a049; transform: translateY(-2px);}}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>⚠️ Error</h2>
+            <p>{message}</p>
+            <a href="/ml-model">Try Again</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+def success_page(filename, df_raw, df_result, unique_preds):
+    """Rendered after a successful upload → preprocess → predict cycle."""
+    total = len(df_result)
+
+    # Build prediction-distribution rows
+    stats_html = "".join([
+        f'<div class="stat-item">'
+        f'<span>{"Churned" if k == 1 else "Not Churned"} ({k})</span>'
+        f'<span>{v} ({v / total * 100:.1f}%)</span>'
+        f'</div>'
+        for k, v in sorted(unique_preds.items())
+    ])
+
+    # Show first 10 rows of the combined result as a preview table
+    preview_html = df_result.head(10).to_html(classes='preview-table', index=False)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Prediction Success</title>
+        <style>
+            body {{font-family: Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 20px;}}
+            .container {{background: white; border-radius: 20px; padding: 40px; max-width: 900px; width: 100%;}}
+            h2 {{color: #4CAF50; text-align: center; margin-bottom: 10px;}}
+            .subtitle {{text-align: center; color: #666; margin-bottom: 25px; font-size: 14px;}}
+            .info {{background: #f5f5f5; padding: 20px; border-radius: 10px; margin-bottom: 20px;}}
+            .stats {{background: #e7f3ff; padding: 20px; border-radius: 10px; margin: 20px 0;}}
+            .stat-item {{display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #ddd;}}
+            .stat-item:last-child {{border-bottom: none;}}
+            .preview-table {{width: 100%; border-collapse: collapse; margin: 15px 0; font-size: 13px; overflow-x: auto; display: block;}}
+            .preview-table th {{background: #667eea; color: white; padding: 10px; text-align: left; white-space: nowrap;}}
+            .preview-table td {{padding: 8px 10px; border-bottom: 1px solid #eee; white-space: nowrap;}}
+            .preview-table tr:hover {{background: #f9f9ff;}}
+            .buttons {{text-align: center; margin-top: 30px;}}
+            a {{display: inline-block; margin: 5px; padding: 12px 25px; background: #4CAF50; color: white; text-decoration: none; border-radius: 10px; font-weight: 600;}}
+            a.secondary {{background: #2196F3;}}
+            a.download  {{background: #FF9800;}}
+            .section-title {{color: #555; font-weight: 600; margin: 20px 0 8px; font-size: 15px;}}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>✅ Upload & Prediction Successful!</h2>
+            <p class="subtitle">Pipeline: Raw data → Preprocessing → XGBoost Model → Predictions</p>
+
+            <div class="info">
+                <p><strong>📄 {filename}</strong><br>
+                   {df_raw.shape[0]} rows × {df_raw.shape[1]} cols (raw) → {total} predictions generated</p>
+            </div>
+
+            <p class="section-title">📊 Prediction Distribution</p>
+            <div class="stats">{stats_html}</div>
+
+            <p class="section-title">📋 Preview (first 10 rows with Churn_Prediction)</p>
+            <div style="overflow-x: auto;">{preview_html}</div>
+
+            <div class="buttons">
+                <a href="/ml-model">Upload New Data</a>
+                <a href="/view_predictions" class="secondary">View All Predictions</a>
+                <a href="/download_predictions" class="download">📥 Download CSV</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ===========================================================================
+# ERROR HANDLERS
+# ===========================================================================
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return error_page("File too large. Maximum allowed: 500 MB."), 413
+
+@app.errorhandler(400)
+def bad_request(error):
+    return error_page("Bad request."), 400
+
+
+# ===========================================================================
+# ENTRY POINT
+# ===========================================================================
+if __name__ == '__main__':
+    print("=" * 50)
+    print("Auto Insurance Churn Prediction System Starting…")
+    print("=" * 50)
+    if setup_database():
+        print("Database ready!  Server starting at http://0.0.0.0:5000")
+        print("=" * 50)
+        app.run(debug=True, host='0.0.0.0', port=5000)
+    else:
+        print("Database setup failed.")
+        print("=" * 50)

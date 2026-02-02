@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Auto Insurance Churn Prediction System</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background: linear-gradient(135deg, #262d56 0%, #8010b4 100%);
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        padding: 20px;
+      }
+
+      .container {
+        max-width: 900px;
+        width: 100%;
+        background: white;
+        border-radius: 20px;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        overflow: hidden;
+      }
+
+      .header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 60px 40px;
+        text-align: center;
+      }
+
+      .header h1 {
+        font-size: 36px;
+        margin-bottom: 15px;
+        font-weight: 700;
+      }
+
+      .header p {
+        font-size: 16px;
+        opacity: 0.95;
+        line-height: 1.6;
+      }
+
+      .content {
+        padding: 50px 40px;
+      }
+
+      .button-section {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 30px;
+        margin-top: 30px;
+      }
+
+      .card-button {
+        background: linear-gradient(135deg, #f5f7fa 0%, #e9ecef 100%);
+        border-radius: 15px;
+        padding: 40px 30px;
+        text-align: center;
+        text-decoration: none;
+        transition: all 0.3s ease;
+        border: 2px solid transparent;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .card-button:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
+        border-color: #667eea;
+      }
+
+      .card-button .icon {
+        font-size: 60px;
+        margin-bottom: 20px;
+      }
+
+      .card-button h2 {
+        color: #333;
+        font-size: 24px;
+        margin-bottom: 10px;
+      }
+
+      .card-button p {
+        color: #666;
+        font-size: 14px;
+        line-height: 1.6;
+      }
+
+      .ml-model {
+        background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+      }
+
+      .dashboard {
+        background: linear-gradient(135deg, #4caf5015 0%, #45a04915 100%);
+      }
+
+      @media (max-width: 768px) {
+        .header h1 {
+          font-size: 28px;
+        }
+
+        .content {
+          padding: 30px 20px;
+        }
+
+        .button-section {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>Auto Insurance Churn Prediction System</h1>
+        <p>
+          Leveraging Machine Learning to predict customer churn and optimize
+          retention strategies
+        </p>
+      </div>
+
+      <div class="content">
+        <div class="button-section">
+          <a href="/ml-model" class="card-button ml-model">
+            <div class="icon">🤖</div>
+            <h2>ML Model</h2>
+            <p>Upload data, train models, and generate predictions</p>
+          </a>
+
+          <a href="/dashboard" class="card-button dashboard">
+            <div class="icon">📊</div>
+            <h2>Dashboard</h2>
+            <p>View KPIs, analytics, and interactive visualizations</p>
+          </a>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
