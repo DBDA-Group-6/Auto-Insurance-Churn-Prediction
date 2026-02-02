@@ -37,7 +37,7 @@ except Exception as e:
     engine = None
 
 # ===========================================================================
-# PREPROCESSING CONSTANTS  →  KEPT EXACTLY THE SAME
+# PREPROCESSING CONSTANTS
 # ===========================================================================
 COLUMNS_TO_DROP = [
     'individual_id', 'address_id', 'cust_orig_date',
@@ -58,36 +58,158 @@ HOME_MARKET_LABEL_MAP = {
 OUTLIER_COLS = ['curr_ann_amt', 'days_tenure', 'age_in_years',
                 'length_of_residence', 'income']
 
-CITY_VALUES = [ ... ]   # ← keeping original long list (omitted here for brevity)
+CITY_VALUES = [
+    'Kaufman', 'Grand Prairie', 'Dallas', 'Arlington', 'Fort Worth',
+    'Carrollton', 'Allen', 'Bedford', 'The Colony', 'Mckinney',
+    'Irving', 'Mesquite', 'Hurst', 'Garland', 'Sachse', 'Euless',
+    'Plano', 'Frisco', 'Grapevine', 'Cedar Hill', 'Keller',
+    'Justin', 'Wylie', 'Aledo', 'Waxahachie', 'Seagoville',
+    'North Richland Hills', 'Desoto', 'Roanoke', 'Southlake',
+    'Lancaster', 'Kemp', 'Mansfield', 'Richardson', 'Rice',
+    'Caddo Mills', 'Red Oak', 'Weatherford', 'Flower Mound', 'Denton',
+    'Ennis', 'Midlothian', 'Coppell', 'Sanger', 'Aubrey', 'Burleson',
+    'Duncanville', 'Crowley', 'Rockwall', 'Rowlett', 'Colleyville',
+    'Lewisville', 'Balch Springs', 'Argyle', 'Lake Dallas', 'Haslet',
+    'Terrell', 'Forney', 'Haltom City', 'Azle', 'Addison', 'Italy',
+    'Springtown', 'Joshua', 'Princeton', 'Anna', 'Little Elm',
+    'Crandall', 'Ponder', 'Royse City', 'Valley View', 'Ferris',
+    'Scurry', 'Farmersville', 'Prosper', 'Kennedale', 'Lavon',
+    'Sunnyvale', 'Celina', 'Pilot Point', 'Blue Ridge', 'Melissa',
+    'Hutchins', 'Palmer', 'Wilmer', 'Krum', 'Tioga', 'Nevada',
+    'Maypearl', 'Era', 'Milford', 'Mertens', 'Forreston', 'Chatfield',
+    'Naval Air Station Jrb'
+]
 
-COUNTY_VALUES = [ ... ] # ← keeping original
+COUNTY_VALUES = [
+    'Kaufman', 'Dallas', 'Tarrant', 'Denton', 'Collin',
+    'Parker', 'Ellis', 'Navarro', 'Hunt', 'Johnson',
+    'Rockwall', 'Cooke', 'Grayson', 'Hill'
+]
 
 MARITAL_STATUS_VALUES = ['Married', 'Single']
 
 # ===========================================================================
-# PREPROCESSING FUNCTIONS  →  KEPT EXACTLY THE SAME
+# PANDAS PREPROCESSING FUNCTIONS
 # ===========================================================================
-def cap_outliers(df, target_cols): ...
-def fill_null_values(df, col_name): ...
-def cat_encoding_fixed(df, column, valid_values): ...
-def preprocess(df_pandas: pd.DataFrame) -> pd.DataFrame: ...
-    # ↑↑↑  ALL LOGIC REMAINS UNCHANGED  ↑↑↑
+def cap_outliers(df, target_cols):
+    """Cap outliers using IQR × 1.5 method"""
+    df = df.copy()
+    
+    for column in target_cols:
+        q1 = df[column].quantile(0.25)
+        q3 = df[column].quantile(0.75)
+        iqr = q3 - q1
+        lower_bound = q1 - (1.5 * iqr)
+        upper_bound = q3 + (1.5 * iqr)
+        
+        # Cap values at bounds
+        df[column] = df[column].clip(lower=lower_bound, upper=upper_bound)
+    
+    return df
+
+
+def fill_null_values(df, col_name):
+    """Fill nulls: numeric → median, categorical → mode"""
+    df = df.copy()
+    
+    # Check if column is numeric or categorical
+    if pd.api.types.is_numeric_dtype(df[col_name]):
+        # Fill with median for numeric columns
+        median = df[col_name].median()
+        df[col_name] = df[col_name].fillna(median)
+    else:
+        # Fill with mode for categorical columns
+        mode = df[col_name].mode()
+        if len(mode) > 0:
+            df[col_name] = df[col_name].fillna(mode[0])
+    
+    return df
+
+
+def cat_encoding_fixed(df, column, valid_values):
+    """
+    One-hot encode categorical column with FIXED set of values.
+    Creates a column for EVERY value in valid_values, ensuring
+    consistent columns between training and inference.
+    """
+    df = df.copy()
+    
+    for val in valid_values:
+        clean_name = f"{column}_{str(val).replace(' ', '_')}"
+        df[clean_name] = (df[column] == val).astype(int)
+    
+    df = df.drop(columns=[column])
+    return df
+
 
 # ===========================================================================
-# DATABASE SETUP  →  unchanged
+# PREPROCESSING FUNCTION                                         
 # ===========================================================================
-def setup_database(): ...
+def preprocess(df_pandas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Takes the raw CSV DataFrame (pandas) and returns the preprocessed DataFrame
+    ready for model.predict(). Steps match final_model_pandas.py exactly.
+    """
+    # Make a copy to avoid modifying original
+    df = df_pandas.copy()
+    
+    # 1) Drop identifier / date columns (NOT city/county)
+    df = df.drop(columns=COLUMNS_TO_DROP, errors='ignore')
+    
+    # 2) Drop the Churn column – it must NOT be fed to the model
+    df = df.drop(columns=['Churn'], errors='ignore')
+    
+    # 3) Label-encode home_market_value
+    df['home_market_value'] = df['home_market_value'].map(HOME_MARKET_LABEL_MAP)
+    
+    # 4) Cap outliers (IQR × 1.5) on the 5 numeric columns
+    df = cap_outliers(df, OUTLIER_COLS)
+    
+    # 5) Fill remaining nulls (median for numeric, mode for categorical)
+    for col_name in df.columns:
+        df = fill_null_values(df, col_name)
+    
+    # 6) One-hot encode city, county, marital_status with FIXED column sets
+    df = cat_encoding_fixed(df, 'city', CITY_VALUES)
+    df = cat_encoding_fixed(df, 'county', COUNTY_VALUES)
+    df = cat_encoding_fixed(df, 'marital_status', MARITAL_STATUS_VALUES)
+    
+    return df
+
+# ===========================================================================
+# DATA BASE SETUP                                              
+# ===========================================================================
+
+def setup_database():
+    """Create database autodb if it does not exist."""
+    try:
+        conn = pymysql.connect(
+            host=RDS_HOST, user=RDS_USER, password=RDS_PASSWORD,
+            port=3306, connect_timeout=10
+        )
+        cursor = conn.cursor()
+        cursor.execute("CREATE DATABASE IF NOT EXISTS autodb")
+        print("Database 'autodb' created/verified successfully")
+        cursor.close()
+        conn.close()
+        return True
+    except pymysql.MySQLError as e:
+        print(f"Database setup error: {e}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error during database setup: {e}")
+        return False
 
 # ===========================================================================
 # ROUTES
 # ===========================================================================
 @app.route('/')
 def index():
-    return render_template('home.html')   # ← assume you keep your original home
+    return render_template('home.html')
 
 @app.route('/ml-model')
 def ml_model():
-    return render_template('index.html')  # ← your upload form (single file)
+    return render_template('index.html')
 
 @app.route('/dashboard')
 def dashboard():
@@ -120,12 +242,12 @@ def upload():
         # Save raw
         df_raw.to_sql(name='rawdata', con=engine, if_exists='replace', index=False)
 
-        # Preprocess (THIS PART REMAINS UNTOUCHED)
+        # Preprocess
         df_preprocessed = preprocess(df_raw)
 
         df_preprocessed.to_sql(name='processed', con=engine, if_exists='replace', index=False)
 
-        # Load model + predict (THIS BLOCK REMAINS UNTOUCHED)
+        # Load model + predict
         if not os.path.exists(MODEL_PATH):
             return error_page(f"Model file not found: {MODEL_PATH}"), 404
 
@@ -326,7 +448,7 @@ def success_page(filename, df_raw, df_result, unique_preds):
 
 
 # ---------------------------------------------------------------------------
-# VIEW PREDICTIONS  (styled like app.py)
+# VIEW PREDICTIONS                      
 # ---------------------------------------------------------------------------
 @app.route('/view_predictions')
 def view_predictions():
@@ -403,7 +525,7 @@ def download_predictions():
 
 
 # ---------------------------------------------------------------------------
-# ERROR & HEALTH  (unchanged logic, error page style updated slightly)
+# ERROR & HEALTH
 # ---------------------------------------------------------------------------
 def error_page(message):
     return f"""
