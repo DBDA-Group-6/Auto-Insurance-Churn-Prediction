@@ -85,11 +85,15 @@ fi
 # ─── 6. Configure Git identity ───────────────────────────────────────────────
 echo -e "\n${GREEN}[STEP 3]${NC} Configuring Git identity …"
 
-echo -e "  Enter your Git user name  (e.g. John Doe): "
-read -r GIT_NAME
+GIT_NAME="DBDA-Group-6"
 
-echo -e "  Enter your Git email      (e.g. you@email.com): "
-read -r GIT_EMAIL
+GIT_EMAIL="zukiroina@gmail.com"
+
+#echo -e "  Enter your Git user name  (e.g. John Doe): "
+#read -r GIT_NAME
+
+#echo -e "  Enter your Git email      (e.g. you@email.com): "
+#read -r GIT_EMAIL
 
 sudo -u "${REAL_USER}" git config --global user.name  "${GIT_NAME}"
 sudo -u "${REAL_USER}" git config --global user.email "${GIT_EMAIL}"
@@ -99,10 +103,13 @@ echo -e "        name  → ${YELLOW}${GIT_NAME}${NC}"
 echo -e "        email → ${YELLOW}${GIT_EMAIL}${NC}"
 
 # ─── 7. Clone repository ─────────────────────────────────────────────────────
-echo -e "\n${GREEN}[STEP 4]${NC} Clone your repository …"
-echo -e "  Enter your GitHub repo SSH URL"
-echo -e "  (e.g. git@github.com:yourusername/yourrepo.git): "
-read -r REPO_URL
+
+REPO_URL="git@github.com:DBDA-Group-6/Auto-Insurance-Churn-Prediction.git"
+
+#echo -e "\n${GREEN}[STEP 4]${NC} Clone your repository …"
+#echo -e "  Enter your GitHub repo SSH URL"
+#echo -e "  (e.g. git@github.com:yourusername/yourrepo.git): "
+#read -r REPO_URL
 
 CLONE_DIR="${HOME_DIR}/project"
 
